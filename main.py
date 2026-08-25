@@ -8,11 +8,10 @@ from pypdf import PdfReader
 app = FastAPI(title="DOMA AI")
 
 # --- PAYMENT LINK CONFIGURATION ---
-# Replace these with your actual Razorpay / Stripe payment links when ready
-PAYMENT_LINK_9 = "https://rzp.io/l/your-9-quick-pass"
-PAYMENT_LINK_49 = "https://rzp.io/l/your-49-monthly"
-PAYMENT_LINK_499 = "https://rzp.io/l/your-499-annual"
-PAYMENT_LINK_999 = "https://rzp.io/l/your-999-lifetime"
+PAYMENT_LINK_9 = "https://rzp.io/rzp/sAiGCgE"
+PAYMENT_LINK_49 = "https://rzp.io/rzp/e0BQ8Ri"
+PAYMENT_LINK_299 = "https://rzp.io/rzp/eRHIstPO"
+PAYMENT_LINK_499 = "https://rzp.io/rzp/gYw0VJVY"
 
 STOPWORDS: Set[str] = {
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "he",
@@ -75,8 +74,8 @@ async def scan_resume(
         "suggested_bullets": suggested_bullets,
         "pay_9_url": PAYMENT_LINK_9,
         "pay_49_url": PAYMENT_LINK_49,
-        "pay_499_url": PAYMENT_LINK_499,
-        "pay_999_url": PAYMENT_LINK_999
+        "pay_299_url": PAYMENT_LINK_299,
+        "pay_499_url": PAYMENT_LINK_499
     }
 
 @app.get("/", response_class=HTMLResponse)
@@ -168,7 +167,7 @@ async def serve_ui():
                     <div id="bulletList" class="space-y-3 pt-2"></div>
                 </div>
 
-                <!-- Pricing Section -->
+                <!-- 4 Pricing Cards ($9, $49, $299, $499) -->
                 <div class="grid md:grid-cols-2 gap-4">
                     <div class="glass-panel p-6 rounded-3xl border border-cyan-500/30 flex flex-col justify-between space-y-4">
                         <div>
@@ -195,22 +194,22 @@ async def serve_ui():
                     <div class="glass-panel p-6 rounded-3xl border border-cyan-500/30 flex flex-col justify-between space-y-4">
                         <div>
                             <span class="text-xs font-bold text-emerald-400 bg-emerald-950/80 px-3 py-1 rounded-full border border-emerald-800">DOMA PRO+</span>
-                            <h4 class="font-black text-2xl text-white mt-2">$499 / year</h4>
-                            <p class="text-xs text-slate-300 mt-1">DOMA Pro+ Unlimited annual access (save over 15%).</p>
+                            <h4 class="font-black text-2xl text-white mt-2">$299 / year</h4>
+                            <p class="text-xs text-slate-300 mt-1">DOMA Pro+ Unlimited annual access (best yearly value).</p>
                         </div>
-                        <button onclick="openPay('499')" class="w-full bg-slate-900 hover:bg-slate-800 text-cyan-300 font-bold py-3 rounded-2xl border border-cyan-500/30 transition">
-                            Subscribe ($499 / yr)
+                        <button onclick="openPay('299')" class="w-full bg-slate-900 hover:bg-slate-800 text-cyan-300 font-bold py-3 rounded-2xl border border-cyan-500/30 transition">
+                            Subscribe ($299 / yr)
                         </button>
                     </div>
 
                     <div class="bg-gradient-to-br from-cyan-950/80 to-blue-950/80 p-6 rounded-3xl border border-cyan-400/50 flex flex-col justify-between space-y-4 ice-glow">
                         <div>
                             <span class="text-xs font-bold text-slate-950 bg-cyan-400 px-3 py-1 rounded-full">DOMA ULTIMATE</span>
-                            <h4 class="font-black text-2xl text-white mt-2">$999 Lifetime</h4>
+                            <h4 class="font-black text-2xl text-white mt-2">$499 Lifetime</h4>
                             <p class="text-xs text-cyan-100/80 mt-1">DOMA Ultimate unlimited scans & features forever.</p>
                         </div>
-                        <button onclick="openPay('999')" class="w-full bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-black py-3 rounded-2xl transition shadow-lg">
-                            Get Ultimate ($999)
+                        <button onclick="openPay('499')" class="w-full bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-black py-3 rounded-2xl transition shadow-lg">
+                            Get Ultimate ($499)
                         </button>
                     </div>
                 </div>
@@ -264,8 +263,8 @@ async def serve_ui():
 
                     urls['9'] = data.pay_9_url;
                     urls['49'] = data.pay_49_url;
+                    urls['299'] = data.pay_299_url;
                     urls['499'] = data.pay_499_url;
-                    urls['999'] = data.pay_999_url;
 
                     document.getElementById('results').classList.remove('hidden');
                     
@@ -298,10 +297,8 @@ async def serve_ui():
 
             function openPay(plan) {
                 const url = urls[plan];
-                if(url && !url.includes('your-')) {
+                if(url) {
                     window.open(url, '_blank');
-                } else {
-                    alert("Please replace the payment link placeholders inside main.py with your real Razorpay links.");
                 }
             }
         </script>

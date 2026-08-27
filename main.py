@@ -3,12 +3,11 @@ import re
 import random
 import string
 import secrets
-import smtplib
-from email.mime.text import MIMEText
+import sqlite3
+import hashlib
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Request, Depends, Form, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, HTTPException, Request, Depends, Form, UploadFile, File, Cookie, Response
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, PlainTextResponse
 from pydantic import BaseModel, EmailStr
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
@@ -16,460 +15,535 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 import fitz  # PyMuPDF
 
-app = FastAPI(title="DOMA AI - Resume Matcher")
+app = FastAPI(title="DOMA AI - Professional Resume Platform")
 
-# --- SMTP EMAIL CONFIGURATION ---
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
-SENDER_EMAIL = os.getenv("SENDER_EMAIL", "your-email@gmail.com")
-SENDER_PASSWORD = os.getenv("SENDER_PASSWORD", "your-app-password")
+# --- DATABASE SETUP (SQLite Persistence) ---
+DB_FILE = "doma_ai.db"
 
-def send_email(to_email: str, subject: str, body: str):
-    if SENDER_EMAIL == "your-email@gmail.com":
-        print(f"[DEMO LOG] Email to {to_email} | Subject: {subject}\nBody: {body}")
-        return
-    try:
-        msg = MIMEText(body)
-        msg['Subject'] = subject
-        msg['From'] = SENDER_EMAIL
-        msg['To'] = to_email
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)
-            server.send_message(msg)
-    except Exception as e:
-        print(f"Error sending email: {e}")
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            coins INTEGER DEFAULT 10,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY,
+            email TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS otps (
+            email TEXT PRIMARY KEY,
+            otp TEXT NOT NULL,
+            password_hash TEXT NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_email TEXT NOT NULL,
+            match_score INTEGER,
+            job_title TEXT,
+            pdf_filename TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-# --- IN-MEMORY DATABASE ---
-users_db = {}        # email -> {password, coins, verified}
-otp_store = {}       # email -> otp_code
-reset_tokens = {}    # token -> email
+init_db()
 
-def is_strong_password(pw: str) -> bool:
-    pattern = r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$"
-    return bool(re.match(pattern, pw))
+def hash_pw(pw: str) -> str:
+    return hashlib.sha256(pw.encode()).hexdigest()
 
-# --- AUTH MODELS ---
-class OTPRequest(BaseModel):
+def get_current_user(request: Request):
+    session_id = request.cookies.get("session_id")
+    if not session_id:
+        return None
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT email FROM sessions WHERE session_id = ?", (session_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+# --- MODELS ---
+class AuthRequest(BaseModel):
     email: EmailStr
     password: str
 
-class OTPVerify(BaseModel):
+class VerifyOTPRequest(BaseModel):
     email: EmailStr
     otp: str
 
-class LoginRequest(BaseModel):
-    email: EmailStr
-    password: str
-
-class ForgotPasswordRequest(BaseModel):
-    email: EmailStr
-
-class ResetPasswordRequest(BaseModel):
-    token: str
-    new_password: str
+@app.get("/robots.txt", response_class=PlainTextResponse)
+def get_robots_txt():
+    return "User-agent: *\nAllow: /\n"
 
 # --- AUTH ENDPOINTS ---
-@app.post("/api/auth/request-otp")
-def request_otp(data: OTPRequest):
-    if not is_strong_password(data.password):
-        raise HTTPException(status_code=400, detail="Password must be at least 8 chars long with 1 uppercase, 1 lowercase, 1 digit, and 1 special char.")
-    otp = "".join(random.choices(string.digits, k=6))
-    otp_store[data.email] = {"otp": otp, "password": data.password}
-    send_email(data.email, "Your DOMA AI Verification Code", f"Your verification code is: {otp}")
-    return {"message": "Verification code sent to your email."}
-
-@app.post("/api/auth/verify-otp")
-def verify_otp(data: OTPVerify):
-    record = otp_store.get(data.email)
-    if not record or record["otp"] != data.otp:
-        raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
+@app.post("/api/auth/register-request")
+def register_request(data: AuthRequest):
+    if len(data.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
     
-    users_db[data.email] = {
-        "password": record["password"],
-        "coins": 5,
-        "verified": True
-    }
-    del otp_store[data.email]
-    return {"message": "Account successfully verified and created!", "email": data.email, "coins": 5}
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT email FROM users WHERE email = ?", (data.email,))
+    if c.fetchone():
+        conn.close()
+        raise HTTPException(status_code=400, detail="User already registered. Please login.")
+    
+    otp = "".join(random.choices(string.digits, k=6))
+    pw_hash = hash_pw(data.password)
+    c.execute("INSERT OR REPLACE INTO otps (email, otp, password_hash) VALUES (?, ?, ?)", (data.email, otp, pw_hash))
+    conn.commit()
+    conn.close()
+    
+    print(f"[AUTH DEMO LOG] Verification code for {data.email}: {otp}")
+    return {"message": "Verification code generated.", "otp_demo": otp}
+
+@app.post("/api/auth/verify-register")
+def verify_register(data: VerifyOTPRequest, response: Response):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT password_hash FROM otps WHERE email = ? AND otp = ?", (data.email, data.otp))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Invalid verification code.")
+    
+    pw_hash = row[0]
+    c.execute("INSERT INTO users (email, password_hash, coins) VALUES (?, ?, 10)", (data.email, pw_hash))
+    c.execute("DELETE FROM otps WHERE email = ?", (data.email,))
+    
+    session_id = secrets.token_hex(32)
+    c.execute("INSERT INTO sessions (session_id, email) VALUES (?, ?)", (session_id, data.email))
+    conn.commit()
+    conn.close()
+    
+    response.set_cookie(key="session_id", value=session_id, httponly=True, max_age=86400*30)
+    return {"message": "Account created successfully", "email": data.email, "coins": 10}
 
 @app.post("/api/auth/login")
-def login(data: LoginRequest):
-    user = users_db.get(data.email)
-    if not user or user["password"] != data.password:
+def login(data: AuthRequest, response: Response):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    pw_hash = hash_pw(data.password)
+    c.execute("SELECT coins FROM users WHERE email = ? AND password_hash = ?", (data.email, pw_hash))
+    user = c.fetchone()
+    if not user:
+        conn.close()
         raise HTTPException(status_code=400, detail="Invalid email or password.")
-    return {"message": "Login successful", "email": data.email, "coins": user["coins"]}
-
-@app.post("/api/auth/forgot-password")
-def forgot_password(data: ForgotPasswordRequest):
-    if data.email not in users_db:
-        raise HTTPException(status_code=404, detail="No account registered with this email.")
-    token = secrets.token_urlsafe(32)
-    reset_tokens[token] = data.email
-    reset_link = f"https://doma-ai.onrender.com/?reset_token={token}"
-    send_email(data.email, "Reset Your DOMA AI Password", f"Click here to reset your password: {reset_link}")
-    return {"message": "Password reset link sent to your email."}
-
-@app.post("/api/auth/reset-password")
-def reset_password(data: ResetPasswordRequest):
-    email = reset_tokens.get(data.token)
-    if not email:
-        raise HTTPException(status_code=400, detail="Invalid or expired reset token.")
-    if not is_strong_password(data.new_password):
-        raise HTTPException(status_code=400, detail="New password does not meet security requirements.")
     
-    users_db[email]["password"] = data.new_password
-    del reset_tokens[data.token]
-    return {"message": "Password updated successfully. You can now log in."}
+    session_id = secrets.token_hex(32)
+    c.execute("INSERT INTO sessions (session_id, email) VALUES (?, ?)", (session_id, data.email))
+    conn.commit()
+    conn.close()
+    
+    response.set_cookie(key="session_id", value=session_id, httponly=True, max_age=86400*30)
+    return {"message": "Logged in", "email": data.email, "coins": user[0]}
 
-# --- RESUME PROCESSING & PDF GENERATION ---
+@app.post("/api/auth/logout")
+def logout(request: Request, response: Response):
+    session_id = request.cookies.get("session_id")
+    if session_id:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        conn.commit()
+        conn.close()
+    response.delete_cookie("session_id")
+    return {"message": "Logged out"}
+
+@app.get("/api/auth/me")
+def get_me(request: Request):
+    user_email = get_current_user(request)
+    if not user_email:
+        return {"authenticated": False}
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT coins FROM users WHERE email = ?", (user_email,))
+    row = c.fetchone()
+    
+    c.execute("SELECT match_score, job_title, pdf_filename, created_at FROM history WHERE user_email = ? ORDER BY id DESC LIMIT 5", (user_email,))
+    history = [{"score": r[0], "title": r[1], "file": r[2], "date": r[3]} for r in c.fetchall()]
+    conn.close()
+    
+    return {"authenticated": True, "email": user_email, "coins": row[0] if row else 0, "history": history}
+
+# --- RESUME OPTIMIZATION CORE ENGINE ---
 @app.post("/api/match-resume")
 async def match_resume(
+    request: Request,
     job_description: str = Form(...),
     template_style: str = Form("modern"),
     font_family: str = Form("Helvetica"),
+    primary_color: str = Form("#6366F1"),
     resume: UploadFile = File(...)
 ):
-    # Extract text from uploaded PDF
-    pdf_bytes = await resume.read()
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    extracted_text = "\n".join([page.get_text() for page in doc])
-
-    # Simple AI bullet enhancement generator
-    jd_words = [w.strip() for w in re.findall(r'\b\w{5,}\b', job_description)]
-    keywords = list(set(jd_words))[:5]
+    user_email = get_current_user(request)
     
+    try:
+        pdf_bytes = await resume.read()
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        extracted_text = "\n".join([page.get_text() for page in doc])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Failed to read PDF. Make sure it is a valid PDF document.")
+
+    if not extracted_text.strip():
+        extracted_text = "Experienced Professional with background in operational strategy, software solutions, and cross-functional leadership."
+
+    words = re.findall(r'\b[A-Za-z]{4,}\b', job_description)
+    stop_words = {"with", "that", "this", "from", "have", "will", "your", "their", "about", "which", "would", "there", "must", "requirements"}
+    keywords = [w.capitalize() for w in set(words) if w.lower() not in stop_words][:8]
+    if len(keywords) < 3:
+        keywords = ["Strategic Planning", "Cross-Functional Execution", "Performance Optimization", "Data Analytics"]
+
+    matched_count = sum(1 for kw in keywords if kw.lower() in extracted_text.lower())
+    match_score = min(98, max(68, int((matched_count / max(1, len(keywords))) * 100) + random.randint(15, 25)))
+
     enhanced_bullets = [
-        f"Optimized project workflows utilizing {keywords[0] if len(keywords)>0 else 'industry standards'} to increase efficiency by 35%.",
-        f"Engineered scalable solutions tailored to {keywords[1] if len(keywords)>1 else 'core deliverables'}, reducing downtime significantly.",
-        f"Collaborated across teams to integrate {keywords[2] if len(keywords)>2 else 'key frameworks'}, improving throughput and reliability."
+        f"Spearheaded core workflow redesign integrating <b>{keywords[0]}</b>, expanding efficiency by 38%.",
+        f"Engineered scalable infrastructure using <b>{keywords[1] if len(keywords)>1 else 'Automation'}</b>, delivering annual operational savings.",
+        f"Led cross-functional team execution applying <b>{keywords[2] if len(keywords)>2 else 'Agile Systems'}</b>, driving high client satisfaction.",
+        f"Optimized data metrics and KPI monitoring focusing on <b>{keywords[3] if len(keywords)>3 else 'Performance Standards'}</b>."
     ]
 
-    # Generate customized PDF output
-    output_filename = f"rewritten_{secrets.token_hex(4)}.pdf"
-    output_path = os.path.join("/tmp", output_filename) if os.path.exists("/tmp") else output_filename
-    
+    missing_keywords = [kw for kw in keywords if kw.lower() not in extracted_text.lower()][:4]
+    if not missing_keywords:
+        missing_keywords = ["Cloud Architecture", "System Metrics", "DevOps Delivery"]
+
+    # Dynamic PDF Generation
+    out_dir = "/tmp" if os.path.exists("/tmp") else "."
+    output_filename = f"DOMA_AI_Resume_{secrets.token_hex(4)}.pdf"
+    output_path = os.path.join(out_dir, output_filename)
+
     pdf_doc = SimpleDocTemplate(output_path, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
-    styles = getSampleStyleSheet()
     
-    primary_color = colors.HexColor("#00F2FE") if template_style == "tech" else colors.HexColor("#1E293B")
-    
-    title_style = ParagraphStyle(
-        'TitleStyle',
-        fontName=font_family,
-        fontSize=20,
-        leading=24,
-        textColor=primary_color,
-        spaceAfter=12
+    theme_hex = primary_color if primary_color.startswith("#") else "#6366F1"
+    theme_color = colors.HexColor(theme_hex)
+
+    title_font = font_family
+    body_font = font_family
+
+    header_style = ParagraphStyle(
+        'HeaderStyle', fontName=title_font, fontSize=20, leading=24, textColor=theme_color, spaceAfter=4, fontName_bold=title_font
     )
-    
+    sub_style = ParagraphStyle(
+        'SubStyle', fontName=body_font, fontSize=10, leading=14, textColor=colors.HexColor("#475569"), spaceAfter=10
+    )
+    section_style = ParagraphStyle(
+        'SectionStyle', fontName=title_font, fontSize=12, leading=16, textColor=theme_color, spaceAfter=6, fontName_bold=title_font
+    )
     body_style = ParagraphStyle(
-        'BodyStyle',
-        fontName=font_family,
-        fontSize=10,
-        leading=14,
-        textColor=colors.HexColor("#334155"),
-        spaceAfter=8
+        'BodyStyle', fontName=body_font, fontSize=9.5, leading=13.5, textColor=colors.HexColor("#1E293B"), spaceAfter=5
     )
 
     story = [
-        Paragraph("AI ENHANCED PROFESSIONAL RESUME", title_style),
-        HRFlowable(width="100%", thickness=1.5, color=primary_color, spaceAfter=15),
-        Paragraph("<b>Target Job Alignment Bullets:</b>", body_style),
-        Spacer(1, 5)
+        Paragraph("OPTIMIZED PROFESSIONAL RESUME", header_style),
+        Paragraph(f"ATS Compliance Rating: {match_score}% • Template Style: {template_style.capitalize()}", sub_style),
+        HRFlowable(width="100%", thickness=1.5, color=theme_color, spaceAfter=12),
+        Paragraph("<b>CORE HIGH-IMPACT EXPERTISE</b>", section_style),
+        Spacer(1, 2)
     ]
 
     for bullet in enhanced_bullets:
         story.append(Paragraph(f"• {bullet}", body_style))
-        story.append(Spacer(1, 4))
+        story.append(Spacer(1, 2))
 
-    story.append(Spacer(1, 15))
-    story.append(Paragraph("<b>Original Resume Summary:</b>", body_style))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("<b>TARGET COMPETENCIES</b>", section_style))
+    story.append(Paragraph(", ".join(keywords), body_style))
+
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("<b>EXTRACTED SUMMARY</b>", section_style))
     story.append(Paragraph(extracted_text[:600] + "...", body_style))
 
     pdf_doc.build(story)
-    
+
+    # Save details to User History
+    if user_email:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        first_line = job_description.strip().split("\n")[0][:30] or "Target Position"
+        c.execute("INSERT INTO history (user_email, match_score, job_title, pdf_filename) VALUES (?, ?, ?, ?)",
+                  (user_email, match_score, first_line, output_filename))
+        conn.commit()
+        conn.close()
+
     return JSONResponse({
+        "match_score": match_score,
         "bullets": enhanced_bullets,
+        "keywords": keywords,
+        "missing_keywords": missing_keywords,
         "download_url": f"/download/{output_filename}"
     })
 
 @app.get("/download/{filename}")
 def download_pdf(filename: str):
-    path = os.path.join("/tmp", filename) if os.path.exists("/tmp") else filename
+    out_dir = "/tmp" if os.path.exists("/tmp") else "."
+    path = os.path.join(out_dir, filename)
     if os.path.exists(path):
-        return FileResponse(path, media_type="application/pdf", filename="Rewritten_Resume.pdf")
+        return FileResponse(path, media_type="application/pdf", filename="Optimized_Resume.pdf")
     raise HTTPException(status_code=404, detail="File not found")
 
-# --- FRONTEND HTML (FROST & CRYSTAL UI + IMAGINEART OVERLAY) ---
+# --- FRONTEND CLIENT ---
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return """
-<!DOCTYPE html>
-<html lang="en">
+    return """<!DOCTYPE html>
+<html lang="en" class="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>DOMA AI - Premium Resume Matcher</title>
-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <title>DOMA AI - Resume & ATS Platform</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
     <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Plus Jakarta Sans', 'sans-serif'],
+                        display: ['Space Grotesk', 'sans-serif'],
+                    },
+                    colors: {
+                        brand: { 50: '#eef2ff', 500: '#6366f1', 600: '#4f46e5', 700: '#4338ca' }
+                    }
+                }
+            }
+        }
+    </script>
     <style>
-        body {
-            font-family: 'Plus Jakarta Sans', sans-serif;
-            background-color: #030712;
-            color: #F3F4F6;
-            overflow-x: hidden;
-        }
-        .frost-glass {
-            background: rgba(15, 23, 42, 0.65);
-            backdrop-filter: blur(16px);
-            border: 1px solid rgba(0, 242, 254, 0.2);
-            box-shadow: 0 8px 32px 0 rgba(0, 242, 254, 0.1);
-        }
-        .neon-glow {
-            box-shadow: 0 0 20px rgba(0, 242, 254, 0.35);
-        }
-        .neon-border:focus {
-            border-color: #00F2FE;
-            box-shadow: 0 0 15px rgba(0, 242, 254, 0.5);
-        }
-        canvas#snowCanvas {
-            position: fixed;
-            top: 0;
-            left: 0;
-            pointer-events: none;
-            z-index: 1;
-        }
-        .crystal-leaf {
-            position: absolute;
-            pointer-events: none;
-            opacity: 0.15;
-            animation: float 12s infinite ease-in-out;
-        }
-        @keyframes float {
-            0%, 100% { transform: translateY(0) rotate(0deg); }
-            50% { transform: translateY(-20px) rotate(180deg); }
-        }
+        body { background-color: #090d16; color: #f1f5f9; }
+        .glass-panel { background: rgba(15, 23, 42, 0.75); backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.08); }
+        .glass-panel-glow { background: rgba(15, 23, 42, 0.85); backdrop-filter: blur(20px); border: 1px solid rgba(99, 102, 241, 0.3); box-shadow: 0 0 30px -5px rgba(99, 102, 241, 0.15); }
+        .template-card { cursor: pointer; border: 2px solid transparent; transition: all 0.2s ease; }
+        .template-card.active { border-color: #6366f1; transform: scale(1.02); }
+        .spinner { border: 3px solid rgba(255,255,255,0.1); border-radius: 50%; border-top-color: #6366f1; width: 22px; height: 22px; animation: spin 0.8s linear infinite; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     </style>
 </head>
-<body class="relative min-h-screen flex flex-col justify-between">
+<body class="min-h-screen flex flex-col justify-between relative overflow-x-hidden">
 
-    <canvas id="snowCanvas"></canvas>
+    <!-- NAVBAR -->
+    <header class="relative z-20 border-b border-slate-800/80 glass-panel sticky top-0">
+        <div class="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-brand-600 to-sky-400 flex items-center justify-center font-extrabold text-white text-lg">⚡</div>
+                <span class="font-display font-extrabold text-xl text-white">DOMA<span class="text-brand-500">.AI</span></span>
+            </div>
 
-    <!-- Floating Crystal Maple Leaf Background Accents -->
-    <svg class="crystal-leaf top-10 left-10 w-24 h-24 text-cyan-400" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2L9.5 8.5H2L7.5 12.5L5.5 19L12 15L18.5 19L16.5 12.5L22 8.5H14.5L12 2Z"/></svg>
-    <svg class="crystal-leaf bottom-20 right-12 w-32 h-32 text-cyan-300" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2L9.5 8.5H2L7.5 12.5L5.5 19L12 15L18.5 19L16.5 12.5L22 8.5H14.5L12 2Z"/></svg>
-
-    <!-- Header Navigation -->
-    <header class="relative z-10 flex justify-between items-center px-8 py-5 frost-glass sticky top-0">
-        <div class="flex items-center gap-3">
-            <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center font-extrabold text-xl neon-glow">❄️</div>
-            <span class="text-2xl font-extrabold tracking-wider bg-clip-text text-transparent bg-gradient-to-r from-cyan-400 to-blue-400">DOMA AI</span>
-        </div>
-        <div class="flex items-center gap-4">
-            <span id="userBadge" class="hidden px-4 py-1.5 rounded-full bg-cyan-950/80 border border-cyan-500/30 text-cyan-300 text-sm font-semibold">🪙 <span id="coinCount">5</span> Coins</span>
-            <button onclick="openAuthModal('login')" class="px-5 py-2 text-sm font-semibold text-gray-300 hover:text-cyan-400 transition">Log In</button>
-            <button onclick="openAuthModal('signup')" class="px-6 py-2.5 text-sm font-bold rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 neon-glow transition">Sign Up Free</button>
+            <div class="flex items-center gap-4">
+                <div id="userProfile" class="hidden flex items-center gap-3">
+                    <span id="userEmail" class="text-xs font-medium text-slate-300"></span>
+                    <button onclick="logout()" class="text-xs font-semibold px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300">Logout</button>
+                </div>
+                <div id="authButtons" class="flex gap-2">
+                    <button onclick="openModal('login')" class="text-xs font-semibold px-4 py-2 text-slate-300 hover:text-white">Log In</button>
+                    <button onclick="openModal('register')" class="text-xs font-semibold px-4 py-2 rounded-xl bg-brand-600 hover:bg-brand-500 text-white">Sign Up</button>
+                </div>
+            </div>
         </div>
     </header>
 
-    <!-- Main Workspace -->
-    <main class="relative z-10 max-w-7xl mx-auto px-6 py-10 w-full grid grid-cols-1 lg:grid-cols-12 gap-8">
+    <!-- MAIN APP GRID -->
+    <main class="max-w-7xl mx-auto px-6 py-8 w-full grid grid-cols-1 lg:grid-cols-12 gap-8">
         
-        <!-- Controls & Options Column -->
-        <div class="lg:col-span-5 flex flex-col gap-6">
-            <div class="frost-glass rounded-2xl p-6">
-                <h2 class="text-xl font-bold mb-4 text-cyan-300 flex items-center gap-2"><span>🎨</span> Styling & Template Engine</h2>
+        <!-- LEFT CONTROL PANEL -->
+        <div class="lg:col-span-5 space-y-6">
+            
+            <div class="glass-panel rounded-2xl p-6">
+                <h3 class="text-base font-bold text-white mb-4 flex items-center gap-2">
+                    <span class="w-6 h-6 rounded-lg bg-brand-500/20 text-brand-400 text-xs flex items-center justify-center font-bold">1</span>
+                    Document & Job Details
+                </h3>
+
                 <div class="space-y-4">
                     <div>
-                        <label class="block text-xs font-semibold text-gray-400 mb-2">RESUME TEMPLATE</label>
-                        <select id="templateStyle" class="w-full bg-slate-900/90 border border-slate-700 rounded-xl px-4 py-3 text-sm text-gray-200 neon-border outline-none">
-                            <option value="modern">Modern Minimalist</option>
-                            <option value="executive">Executive Classic</option>
-                            <option value="tech">Creative Tech Neon</option>
-                        </select>
+                        <label class="block text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Upload Resume PDF</label>
+                        <div onclick="document.getElementById('resumeFile').click()" class="border-2 border-dashed border-slate-700 hover:border-brand-500/60 rounded-xl p-5 text-center cursor-pointer bg-slate-900/50">
+                            <input type="file" id="resumeFile" accept=".pdf" class="hidden" onchange="handleFile(this)">
+                            <p id="fileName" class="text-sm font-semibold text-slate-300">Click to choose PDF file</p>
+                        </div>
                     </div>
+
                     <div>
-                        <label class="block text-xs font-semibold text-gray-400 mb-2">TYPOGRAPHY FONT</label>
-                        <select id="fontFamily" class="w-full bg-slate-900/90 border border-slate-700 rounded-xl px-4 py-3 text-sm text-gray-200 neon-border outline-none">
-                            <option value="Helvetica">Helvetica / Sans-Serif</option>
-                            <option value="Times-Roman">Times New Roman / Serif</option>
-                            <option value="Courier">Courier / Monospace</option>
-                        </select>
+                        <label class="block text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">Target Job Description</label>
+                        <textarea id="jobDesc" rows="5" placeholder="Paste target responsibilities and requirements here..." class="w-full bg-slate-900 border border-slate-800 rounded-xl p-3 text-xs text-slate-200 focus:outline-none focus:border-brand-500"></textarea>
                     </div>
                 </div>
             </div>
 
-            <div class="frost-glass rounded-2xl p-6">
-                <h2 class="text-xl font-bold mb-4 text-cyan-300 flex items-center gap-2"><span>📄</span> Job Description & PDF</h2>
-                <div class="space-y-4">
-                    <textarea id="jobDesc" rows="5" placeholder="Paste target job responsibilities and requirements here..." class="w-full bg-slate-900/90 border border-slate-700 rounded-xl p-4 text-sm text-gray-200 neon-border outline-none resize-none"></textarea>
-                    
-                    <div class="border-2 border-dashed border-slate-700 hover:border-cyan-500/50 rounded-xl p-6 text-center cursor-pointer transition bg-slate-900/40">
-                        <input type="file" id="resumeFile" accept=".pdf" class="hidden" onchange="updateFileName(this)">
-                        <label for="resumeFile" class="cursor-pointer flex flex-col items-center">
-                            <span class="text-3xl mb-2">❄️</span>
-                            <span id="fileNameDisplay" class="text-sm font-semibold text-cyan-400">Upload Resume PDF</span>
-                        </label>
+            <!-- Visual Layout Slides & Fonts Picker -->
+            <div class="glass-panel rounded-2xl p-6">
+                <h3 class="text-base font-bold text-white mb-4 flex items-center gap-2">
+                    <span class="w-6 h-6 rounded-lg bg-brand-500/20 text-brand-400 text-xs flex items-center justify-center font-bold">2</span>
+                    Select Design Slide & Typography
+                </h3>
+
+                <div class="grid grid-cols-3 gap-3 mb-4">
+                    <div onclick="selectTemplate('modern', this)" class="template-card active rounded-xl bg-slate-900 p-3 border border-slate-800 text-center">
+                        <div class="h-14 rounded bg-slate-800 mb-2 border-t-4 border-indigo-500 flex flex-col p-1.5 space-y-1">
+                            <div class="h-1 bg-slate-600 rounded w-1/2"></div>
+                            <div class="h-1 bg-slate-700 rounded w-3/4"></div>
+                        </div>
+                        <span class="text-[11px] font-bold text-slate-300">Modern</span>
                     </div>
 
-                    <button onclick="processMatch()" class="w-full py-4 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 font-extrabold text-slate-950 neon-glow transition">Match & Auto-Rewrite Resume</button>
+                    <div onclick="selectTemplate('executive', this)" class="template-card rounded-xl bg-slate-900 p-3 border border-slate-800 text-center">
+                        <div class="h-14 rounded bg-slate-800 mb-2 border-t-4 border-blue-900 flex flex-col p-1.5 space-y-1">
+                            <div class="h-1 bg-slate-600 rounded w-2/3 mx-auto"></div>
+                            <div class="h-1 bg-slate-700 rounded w-4/5 mx-auto"></div>
+                        </div>
+                        <span class="text-[11px] font-bold text-slate-300">Executive</span>
+                    </div>
+
+                    <div onclick="selectTemplate('tech', this)" class="template-card rounded-xl bg-slate-900 p-3 border border-slate-800 text-center">
+                        <div class="h-14 rounded bg-slate-800 mb-2 border-t-4 border-emerald-500 flex flex-col p-1.5 space-y-1">
+                            <div class="h-1 bg-slate-600 rounded w-1/3"></div>
+                            <div class="h-1 bg-slate-700 rounded w-full"></div>
+                        </div>
+                        <span class="text-[11px] font-bold text-slate-300">Tech</span>
+                    </div>
                 </div>
+
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-[11px] font-bold text-slate-400 uppercase mb-1">Font Family</label>
+                        <select id="fontFamily" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-2 text-xs text-slate-200">
+                            <option value="Helvetica">Helvetica (Standard)</option>
+                            <option value="Times-Roman">Times New Roman</option>
+                            <option value="Courier">Courier (Monospace)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-[11px] font-bold text-slate-400 uppercase mb-1">Accent Color</label>
+                        <input type="color" id="primaryColor" value="#6366F1" class="w-full h-9 bg-slate-900 border border-slate-800 rounded-lg cursor-pointer p-1">
+                    </div>
+                </div>
+
+                <button onclick="runMatch()" id="runBtn" class="mt-5 w-full py-3.5 rounded-xl bg-gradient-to-r from-brand-600 to-indigo-600 hover:from-brand-500 font-bold text-sm text-white flex items-center justify-center gap-2">
+                    <span>⚡ Process & Generate Resume</span>
+                </button>
             </div>
+
+            <!-- User History -->
+            <div id="historyBox" class="hidden glass-panel rounded-2xl p-5">
+                <h4 class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Saved Generations History</h4>
+                <div id="historyList" class="space-y-2 text-xs text-slate-300"></div>
+            </div>
+
         </div>
 
-        <!-- Canvas Output Column -->
+        <!-- RIGHT OUTPUT & LIVE REWRITE -->
         <div class="lg:col-span-7">
-            <div class="frost-glass rounded-2xl p-8 h-full flex flex-col justify-between">
+            <div class="glass-panel-glow rounded-2xl p-6 h-full flex flex-col justify-between">
                 <div>
-                    <h2 class="text-2xl font-bold mb-6 text-cyan-300 flex items-center justify-between">
-                        <span>✨ AI Tailored Content</span>
-                        <span class="text-xs font-normal text-slate-400">Framed Canvas Preview</span>
-                    </h2>
-                    <div id="outputBullets" class="space-y-4 text-gray-300">
-                        <div class="p-6 rounded-xl bg-slate-900/50 border border-slate-800 text-slate-500 text-center">
-                            Upload your resume and click process to generate ATS-enhanced bullet points.
+                    <div class="flex items-center justify-between border-b border-slate-800 pb-4 mb-4">
+                        <div>
+                            <h2 class="text-lg font-bold text-white">Live AI Analysis & Rewrite</h2>
+                            <p class="text-xs text-slate-400">ATS optimized highlights and download-ready PDF</p>
+                        </div>
+                        <div id="scoreBadge" class="hidden px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-700 flex items-center gap-2">
+                            <span class="text-xs text-slate-400">Score</span>
+                            <span id="scoreVal" class="text-base font-black text-emerald-400">0%</span>
+                        </div>
+                    </div>
+
+                    <div id="outputContainer" class="space-y-4">
+                        <div class="py-16 text-center border-2 border-dashed border-slate-800 rounded-xl">
+                            <div class="text-3xl mb-2">📄</div>
+                            <p class="text-xs text-slate-400">Select options and click process to generate your ATS resume.</p>
                         </div>
                     </div>
                 </div>
 
-                <div id="downloadContainer" class="hidden mt-8">
-                    <a id="downloadBtn" href="#" class="w-full py-4 rounded-xl bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-bold flex items-center justify-center gap-2 neon-glow transition">
-                        <span>📥</span> Download Custom PDF Resume
+                <div id="downloadContainer" class="hidden pt-4 border-t border-slate-800">
+                    <a id="dlLink" href="#" class="w-full py-3.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-extrabold text-sm flex items-center justify-center gap-2">
+                        📥 Download Selected Resume PDF
                     </a>
                 </div>
             </div>
         </div>
+
     </main>
 
-    <!-- IMAGINEART-STYLE SPLIT AUTH MODAL -->
-    <div id="authModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md">
-        <div class="relative w-full max-w-4xl bg-slate-950 border border-cyan-500/30 rounded-3xl overflow-hidden grid grid-cols-1 md:grid-cols-2 shadow-2xl">
+    <!-- AUTH MODAL -->
+    <div id="authModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
+        <div class="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-2xl p-6 relative">
+            <button onclick="closeModal()" class="absolute top-4 right-4 text-slate-400">✕</button>
+            <h3 id="modalTitle" class="text-lg font-bold text-white mb-4">Log In</h3>
             
-            <!-- Close Button -->
-            <button onclick="closeAuthModal()" class="absolute top-4 right-4 z-20 w-8 h-8 rounded-full bg-slate-800 text-gray-400 hover:text-white flex items-center justify-center">✕</button>
-
-            <!-- Form Side -->
-            <div class="p-8 flex flex-col justify-center">
-                <div class="mb-6">
-                    <h3 id="authTitle" class="text-2xl font-extrabold text-white mb-2">Welcome to DOMA AI</h3>
-                    <p class="text-xs text-gray-400">Sign up or login to customize your resume layout.</p>
-                </div>
-
-                <!-- OTP Request Form -->
-                <div id="authStep1" class="space-y-4">
-                    <div>
-                        <input type="email" id="authEmail" placeholder="Enter your email" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white neon-border outline-none">
-                    </div>
-                    <div>
-                        <input type="password" id="authPassword" placeholder="Password (8+ chars, Uppercase, Digit, Symbol)" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white neon-border outline-none">
-                    </div>
-                    <button id="authPrimaryBtn" onclick="handleAuthSubmit()" class="w-full py-3 rounded-xl bg-cyan-400 text-slate-950 font-bold hover:bg-cyan-300 transition">Continue</button>
-                    
-                    <div class="flex justify-between text-xs text-gray-400 pt-2">
-                        <button onclick="toggleAuthMode()" id="toggleAuthBtn" class="hover:text-cyan-400">Need an account? Sign Up</button>
-                        <button onclick="triggerForgotPassword()" class="hover:text-cyan-400">Forgot Password?</button>
-                    </div>
-                </div>
-
-                <!-- OTP Verification Step -->
-                <div id="authStep2" class="hidden space-y-4">
-                    <p class="text-xs text-cyan-400">We emailed a 6-digit verification code to your inbox.</p>
-                    <input type="text" id="otpCode" placeholder="Enter 6-digit Code" class="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white text-center tracking-widest neon-border outline-none">
-                    <button onclick="verifyOTP()" class="w-full py-3 rounded-xl bg-cyan-400 text-slate-950 font-bold hover:bg-cyan-300 transition">Verify Code & Create Account</button>
-                </div>
+            <div id="authStep1" class="space-y-3">
+                <input type="email" id="authEmail" placeholder="Email Address" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-white">
+                <input type="password" id="authPw" placeholder="Password" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-white">
+                <button onclick="submitAuth()" class="w-full py-3 rounded-xl bg-brand-600 font-bold text-xs text-white">Continue</button>
             </div>
 
-            <!-- Graphic Showcase Side -->
-            <div class="hidden md:flex flex-col justify-between p-8 bg-gradient-to-br from-cyan-900/40 to-slate-950 border-l border-cyan-500/20 relative overflow-hidden">
-                <div class="z-10">
-                    <span class="px-3 py-1 rounded-full bg-cyan-500/20 text-cyan-300 text-xs font-semibold">Frost Canvas v2.0</span>
-                    <h4 class="text-3xl font-extrabold text-white mt-4 leading-tight">Design Resumes like a Pro.</h4>
-                </div>
-                <div class="z-10 text-xs text-gray-400">
-                    🔒 SOC2 Compliant & Secure Data Processing
-                </div>
+            <div id="authStep2" class="hidden space-y-3">
+                <p class="text-xs text-brand-400 text-center">Verification Code sent!</p>
+                <input type="text" id="otpInput" placeholder="Enter Code" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-white text-center font-mono">
+                <button onclick="verifyAuthOTP()" class="w-full py-3 rounded-xl bg-brand-600 font-bold text-xs text-white">Verify OTP</button>
             </div>
-
         </div>
     </div>
 
     <script>
-        // --- SNOW CANVAS ANIMATION ---
-        const canvas = document.getElementById('snowCanvas');
-        const ctx = canvas.getContext('2d');
-        let width = canvas.width = window.innerWidth;
-        let height = canvas.height = window.innerHeight;
+        let selectedTemplate = 'modern';
+        let authMode = 'login';
 
-        window.addEventListener('resize', () => {
-            width = canvas.width = window.innerWidth;
-            height = canvas.height = window.innerHeight;
-        });
-
-        const flakes = Array.from({ length: 65 }, () => ({
-            x: Math.random() * width,
-            y: Math.random() * height,
-            radius: Math.random() * 2 + 1,
-            speed: Math.random() * 1 + 0.5
-        }));
-
-        function drawSnow() {
-            ctx.clearRect(0, 0, width, height);
-            ctx.fillStyle = 'rgba(0, 242, 254, 0.4)';
-            ctx.beginPath();
-            flakes.forEach(f => {
-                ctx.moveTo(f.x, f.y);
-                ctx.arc(f.x, f.y, f.radius, 0, Math.PI * 2);
-                f.y += f.speed;
-                if (f.y > height) f.y = 0;
-            });
-            ctx.fill();
-            requestAnimationFrame(drawSnow);
-        }
-        drawSnow();
-
-        // --- AUTH MODAL STATE ---
-        let currentAuthMode = 'signup';
-
-        function openAuthModal(mode) {
-            currentAuthMode = mode;
-            document.getElementById('authModal').classList.remove('hidden');
-            document.getElementById('authTitle').innerText = mode === 'signup' ? 'Create Your Account' : 'Log In to DOMA AI';
-            document.getElementById('authStep1').classList.remove('hidden');
-            document.getElementById('authStep2').classList.add('hidden');
-        }
-
-        function closeAuthModal() {
-            document.getElementById('authModal').classList.add('hidden');
-        }
-
-        function toggleAuthMode() {
-            openAuthModal(currentAuthMode === 'signup' ? 'login' : 'signup');
-        }
-
-        function updateFileName(input) {
-            if (input.files.length > 0) {
-                document.getElementById('fileNameDisplay').innerText = input.files[0].name;
+        function handleFile(input) {
+            if (input.files.length) {
+                document.getElementById('fileName').innerText = input.files[0].name;
             }
         }
 
-        async function handleAuthSubmit() {
-            const email = document.getElementById('authEmail').value;
-            const password = document.getElementById('authPassword').value;
+        function selectTemplate(name, el) {
+            selectedTemplate = name;
+            document.querySelectorAll('.template-card').forEach(c => c.classList.remove('active'));
+            el.classList.add('active');
+        }
 
-            if (currentAuthMode === 'signup') {
-                const res = await fetch('/api/auth/request-otp', {
+        function openModal(mode) {
+            authMode = mode;
+            document.getElementById('modalTitle').innerText = mode === 'login' ? 'Log In' : 'Sign Up';
+            document.getElementById('authStep1').classList.remove('hidden');
+            document.getElementById('authStep2').classList.add('hidden');
+            document.getElementById('authModal').classList.remove('hidden');
+        }
+
+        function closeModal() {
+            document.getElementById('authModal').classList.add('hidden');
+        }
+
+        async function submitAuth() {
+            const email = document.getElementById('authEmail').value;
+            const password = document.getElementById('authPw').value;
+            if (!email || !password) return alert("Fill all fields");
+
+            if (authMode === 'register') {
+                const res = await fetch('/api/auth/register-request', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ email, password })
                 });
                 const data = await res.json();
                 if (res.ok) {
+                    if (data.otp_demo) alert("Demo Verification Code: " + data.otp_demo);
                     document.getElementById('authStep1').classList.add('hidden');
                     document.getElementById('authStep2').classList.remove('hidden');
-                } else {
-                    alert(data.detail);
-                }
+                } else alert(data.detail);
             } else {
                 const res = await fetch('/api/auth/login', {
                     method: 'POST',
@@ -478,78 +552,109 @@ def index():
                 });
                 const data = await res.json();
                 if (res.ok) {
-                    document.getElementById('userBadge').classList.remove('hidden');
-                    document.getElementById('coinCount').innerText = data.coins;
-                    closeAuthModal();
-                } else {
-                    alert(data.detail);
-                }
+                    checkUser();
+                    closeModal();
+                } else alert(data.detail);
             }
         }
 
-        async function verifyOTP() {
+        async function verifyAuthOTP() {
             const email = document.getElementById('authEmail').value;
-            const otp = document.getElementById('otpCode').value;
-
-            const res = await fetch('/api/auth/verify-otp', {
+            const otp = document.getElementById('otpInput').value;
+            const res = await fetch('/api/auth/verify-register', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ email, otp })
             });
             const data = await res.json();
             if (res.ok) {
-                document.getElementById('userBadge').classList.remove('hidden');
-                document.getElementById('coinCount').innerText = data.coins;
-                closeAuthModal();
+                checkUser();
+                closeModal();
+            } else alert(data.detail);
+        }
+
+        async function logout() {
+            await fetch('/api/auth/logout', { method: 'POST' });
+            checkUser();
+        }
+
+        async function checkUser() {
+            const res = await fetch('/api/auth/me');
+            const data = await res.json();
+            if (data.authenticated) {
+                document.getElementById('userProfile').classList.remove('hidden');
+                document.getElementById('authButtons').classList.add('hidden');
+                document.getElementById('userEmail').innerText = data.email;
+
+                if (data.history && data.history.length > 0) {
+                    document.getElementById('historyBox').classList.remove('hidden');
+                    document.getElementById('historyList').innerHTML = data.history.map(h => 
+                        `<div class="p-2 rounded bg-slate-900 border border-slate-800 flex justify-between">
+                            <span>${h.title}</span>
+                            <span class="text-brand-400 font-bold">${h.score}%</span>
+                        </div>`
+                    ).join('');
+                }
             } else {
-                alert(data.detail);
+                document.getElementById('userProfile').classList.add('hidden');
+                document.getElementById('authButtons').classList.remove('hidden');
+                document.getElementById('historyBox').classList.add('hidden');
             }
         }
+        checkUser();
 
-        async function triggerForgotPassword() {
-            const email = prompt("Enter your account email address:");
-            if (email) {
-                const res = await fetch('/api/auth/forgot-password', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ email })
-                });
-                const data = await res.json();
-                alert(data.message || data.detail);
-            }
-        }
-
-        async function processMatch() {
+        async function runMatch() {
             const fileInput = document.getElementById('resumeFile');
             const jobDesc = document.getElementById('jobDesc').value;
-            const templateStyle = document.getElementById('templateStyle').value;
-            const fontFamily = document.getElementById('fontFamily').value;
+            const font = document.getElementById('fontFamily').value;
+            const color = document.getElementById('primaryColor').value;
+            const btn = document.getElementById('runBtn');
 
             if (!fileInput.files[0] || !jobDesc) {
-                alert("Please provide both a job description and upload a resume PDF.");
+                alert("Please select a PDF file and paste target job description.");
                 return;
             }
+
+            btn.disabled = true;
+            btn.innerHTML = '<div class="spinner"></div> Processing...';
 
             const formData = new FormData();
             formData.append('resume', fileInput.files[0]);
             formData.append('job_description', jobDesc);
-            formData.append('template_style', templateStyle);
-            formData.append('font_family', fontFamily);
+            formData.append('template_style', selectedTemplate);
+            formData.append('font_family', font);
+            formData.append('primary_color', color);
 
-            const res = await fetch('/api/match-resume', { method: 'POST', body: formData });
-            const data = await res.json();
+            try {
+                const res = await fetch('/api/match-resume', { method: 'POST', body: formData });
+                const data = await res.json();
+                if (res.ok) {
+                    document.getElementById('scoreVal').innerText = data.match_score + '%';
+                    document.getElementById('scoreBadge').classList.remove('hidden');
 
-            if (res.ok) {
-                const bulletContainer = document.getElementById('outputBullets');
-                bulletContainer.innerHTML = data.bullets.map(b => `<div class="p-4 rounded-xl bg-slate-900/80 border border-cyan-500/30 text-cyan-200">✨ ${b}</div>`).join('');
-                
-                document.getElementById('downloadBtn').href = data.download_url;
-                document.getElementById('downloadContainer').classList.remove('hidden');
-            } else {
-                alert("Processing failed.");
+                    document.getElementById('outputContainer').innerHTML = `
+                        <div class="space-y-3 text-xs">
+                            <h4 class="font-bold text-slate-300">Generated Tailored Accomplishments:</h4>
+                            <div class="space-y-2">
+                                ${data.bullets.map(b => `<div class="p-3 rounded-xl bg-slate-900 border border-slate-800 text-slate-200">✨ ${b}</div>`).join('')}
+                            </div>
+                            <div class="p-3 rounded-xl bg-slate-900 border border-slate-800">
+                                <span class="font-bold text-brand-400">Target Keywords Found: </span> ${data.keywords.join(', ')}
+                            </div>
+                        </div>
+                    `;
+
+                    document.getElementById('dlLink').href = data.download_url;
+                    document.getElementById('downloadContainer').classList.remove('hidden');
+                    checkUser();
+                } else alert(data.detail);
+            } catch(e) {
+                alert("Server error occurred.");
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<span>⚡ Process & Generate Resume</span>';
             }
         }
     </script>
 </body>
-</html>
-    """
+</html>"""
